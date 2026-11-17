@@ -45,8 +45,6 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
     private var clippedRegions: [CGRect] = []
     private var appliedRegions: [CGRect]?
     private var lastGood: (image: CGImage, area: CGRect, scale: CGFloat, shelf: CGRect)?
-    private var triedQuartz = false
-    private var triedComposite = false
     private var compositions: UInt64 = 0
     private var previousCounters = ""
     private let counterFile: URL? = {
@@ -129,8 +127,6 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
         latest = nil
         let token = generation
         let scale = CGFloat(frame.dock.width)/frame.area.width
-        let state = capture?.status ?? ""
-        let kind = state.contains("composite") ? "composite" : (state.contains("Quartz") ? "quartz" : "stream")
         let area = frame.area
         let dock = frame.dock
         let wallpaper = frame.wallpaper
@@ -145,22 +141,9 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
                 if token == self.generation {
                     self.compositions &+= 1
                     let geometryChanged = self.lastGood?.shelf != shelf
+                    if result != nil { self.capture?.shelf = shelf }
                     self.lastGood = result.map { ($0, area, scale, shelf) }
                     if geometryChanged && result != nil { self.checkWindows(in: area, shelf: shelf) }
-                    if result == nil && !self.triedQuartz && kind == "stream" {
-                        self.triedQuartz = true
-                        DispatchQueue.main.asyncAfter(deadline: .now()+1.0) { [weak self] in
-                            guard let self, self.lastGood == nil else { return }
-                            self.capture?.retryUsingQuartzCrops()
-                        }
-                    }
-                    if result == nil && !self.triedComposite && kind == "quartz" {
-                        self.triedComposite = true
-                        DispatchQueue.main.asyncAfter(deadline: .now()+0.8) { [weak self] in
-                            guard let self, self.lastGood == nil else { return }
-                            self.capture?.retryUsingWallpaperComposite()
-                        }
-                    }
                     self.present()
                 }
                 self.consume()
@@ -169,6 +152,7 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
     }
 
     private func updatePresentation(forceWindowCheck: Bool = false) {
+        capture?.tick()
         if let counterFile, let capture {
             let counters = "wall=\(capture.wallpaperUpdates) dock=\(capture.dockUpdates) rendered=\(compositions) visible=\(panel.isVisible) mode=\(capture.status)\n"
             if counters != previousCounters,
