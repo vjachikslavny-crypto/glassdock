@@ -2,7 +2,7 @@ name: Publish GlassDock
 on:
   push:
     branches: [main]
-    paths: [VERSION]
+    paths: [VERSION, downloads/GlassDock.dmg]
   workflow_dispatch:
 
 permissions:
@@ -10,22 +10,23 @@ permissions:
 
 concurrency:
   group: glassdock-release
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   release:
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Build universal disk image
-        run: bash build.sh
+      - name: Verify the tested disk image
+        working-directory: downloads
+        run: sha256sum -c GlassDock.dmg.sha256
       - name: Publish disk image and checksum
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(cat VERSION)
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then exit 1; fi
-          gh release create "v$version" build/GlassDock.dmg build/GlassDock.dmg.sha256 \
+          gh release create "v$version" downloads/GlassDock.dmg downloads/GlassDock.dmg.sha256 \
             --target "$GITHUB_SHA" --title "GlassDock $version" --notes-file RELEASE.md

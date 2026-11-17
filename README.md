@@ -2,7 +2,7 @@
 
 GlassDock показывает обои за строкой меню и между значками нижнего Dock. В окне приложения два отдельных переключателя. Можно включить один эффект, оба или выключить их в любой момент.
 
-**[Скачать GlassDock для Mac (.dmg)](https://github.com/vjachikslavny-crypto/glassdock/releases/latest/download/GlassDock.dmg)** · [Все версии и контрольные суммы](https://github.com/vjachikslavny-crypto/glassdock/releases)
+**[Скачать GlassDock для Mac (.dmg)](https://github.com/vjachikslavny-crypto/glassdock/raw/refs/heads/main/downloads/GlassDock.dmg)** · [Контрольная сумма SHA-256](downloads/GlassDock.dmg.sha256) · [Релизы](https://github.com/vjachikslavny-crypto/glassdock/releases)
 
 ### Установка
 
