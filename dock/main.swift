@@ -85,7 +85,7 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
         guard capture == nil else { return }
         let component = DockCapture(onMagnificationVisibilityChange: { [weak self] in
             guard let self else { return }
-            if self.capture?.hidesOverlayForMagnification == false, let info = self.lastGood {
+            if self.capture?.hidesOverlayForInteraction == false, let info = self.lastGood {
                 self.checkWindows(in: info.area, shelf: info.shelf)
             }
             self.present()
@@ -159,20 +159,22 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
     }
 
     private func updatePresentation(forceWindowCheck: Bool = false) {
-        capture?.tick()
+        // Workspace notifications have their own capture handlers. In particular,
+        // activation checks the previous window set before updating that set.
+        if !forceWindowCheck { capture?.tick() }
         let hovering = capture?.hovering == true
         if wasHovering != hovering {
             wasHovering = hovering
             present()
         }
         if let counterFile, let capture {
-            let counters = "wall=\(capture.wallpaperUpdates) dock=\(capture.dockUpdates) rendered=\(compositions) visible=\(panel.isVisible) hover=\(hovering) mode=\(capture.status)\n"
+            let counters = "wall=\(capture.wallpaperUpdates) dock=\(capture.dockUpdates) rendered=\(compositions) visible=\(panel.isVisible) hover=\(hovering) titlebar=\(capture.titlebarHoverHidden) moves=\(capture.pointerEvents) buttons=\(capture.buttonEvents) approaches=\(capture.titlebarApproaches) mode=\(capture.status)\n"
             if counters != previousCounters,
                (try? counters.write(to: counterFile, atomically: true, encoding: .utf8)) != nil {
                 previousCounters = counters
             }
         }
-        guard capture?.hidesOverlayForMagnification != true, let sample = lastGood else { return }
+        guard capture?.hidesOverlayForInteraction != true, let sample = lastGood else { return }
         // Recheck quickly during a window drag and just after release. Typing or
         // simply moving the pointer need not enumerate every window on the desktop.
         if !forceWindowCheck && ProcessInfo.processInfo.systemUptime - lastWindowCheck < 3 &&
@@ -219,7 +221,7 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
     }
 
     private func present() {
-        guard capture?.hidesOverlayForMagnification != true, !covered,
+        guard capture?.hidesOverlayForInteraction != true, !covered,
               let info = lastGood, let layer = panel.contentView?.layer else {
             if panel.isVisible { panel.orderOut(nil) }
             return

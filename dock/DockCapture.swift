@@ -17,6 +17,7 @@ final class DockCapture {
     private var inFlight = false
     private var deadline: TimeInterval?
     private var nextMetadata: TimeInterval = 0
+    private var watchWindowsUntil: TimeInterval = 0
     private var wallSettlesAfter: TimeInterval = 0
     private(set) var hovering = false
     private var magnification = false
@@ -29,12 +30,40 @@ final class DockCapture {
     private var restoreAfter: TimeInterval?
     private(set) var hidesOverlayForMagnification = false
     private var pointerMonitor: Any?
+    private var buttonMonitor: Any?
+    private var layoutButtonHeld = false
+    private var pendingMinimizeWindow: CGWindowID?
+    private(set) var titlebarHoverHidden = false
+    private(set) var pointerEvents = 0
+    private(set) var buttonEvents = 0
+    private(set) var titlebarApproaches = 0
+    var hidesOverlayForInteraction: Bool { hidesOverlayForMagnification || titlebarHoverHidden }
+    private struct HitWindow {
+        let id: CGWindowID
+        let bounds: CGRect
+        let eligible: Bool
+    }
+    private var titlebarWindows: [HitWindow] = []
+    private var dockProcessID: pid_t?
+    private struct DockInteraction {
+        var originalRegion: CGRect
+        var watchUntil: TimeInterval
+        var waitForExit = false
+    }
+    private var dockInteraction: DockInteraction?
+    private struct LayoutTransition {
+        var quietUntil: TimeInterval
+        var previousShape: Data?
+        var samples = 0
+    }
+    private var transition: LayoutTransition?
     private var autoHideFrameReady = false
     private var wasAtRevealEdge = false
     private var dragStart: CGPoint?
     private var draggedDockItem = false
     private var wallpaper: CGImage?
     private var lastMetadata: Metadata?
+    private var visibleWindowOwners: Set<pid_t>?
     private var permission = false
 
     private(set) var status = "idle snapshots"
@@ -89,8 +118,29 @@ final class DockCapture {
         observe(Notification.Name("com.apple.dock.prefchanged"), in: distributed) { $0.tick() }
         observe(Notification.Name("com.apple.screenIsUnlocked"), in: distributed) { $0.layoutChanged(wall: true, delay: 5.5) }
         observe(Notification.Name("com.apple.screensaver.didstop"), in: distributed) { $0.layoutChanged(wall: true, delay: 5.5) }
-        observe(NSWorkspace.didLaunchApplicationNotification, in: ws, regularAppsOnly: true) { $0.layoutChanged(wall: false) }
-        observe(NSWorkspace.didTerminateApplicationNotification, in: ws, regularAppsOnly: true) { $0.layoutChanged(wall: false) }
+        for name in [NSWorkspace.willLaunchApplicationNotification, NSWorkspace.didLaunchApplicationNotification,
+                     NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didHideApplicationNotification,
+                     NSWorkspace.didUnhideApplicationNotification] {
+            observe(name, in: ws, regularAppsOnly: true) { $0.beginDockTransition() }
+        }
+        observe(NSWorkspace.didActivateApplicationNotification, in: ws, regularAppsOnly: true) { $0.applicationActivated() }
+        buttonMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self, self.started, self.pauses.isEmpty, let screen = NSScreen.screens.first else { return }
+                self.buttonEvents += 1
+                // Use the point of the click even if the pointer has since moved.
+                let cgEvent = event.cgEvent
+                let point = cgEvent.map {
+                    CGPoint(x: $0.location.x, y: screen.frame.maxY - $0.location.y)
+                } ?? NSEvent.mouseLocation
+                let recipient = cgEvent?.getIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent) ?? 0
+                let windowID = CGWindowID(exactly: recipient > 0 ? recipient : Int64(event.windowNumber)) ?? 0
+                let pid = pid_t(exactly: cgEvent?.getIntegerValueField(.eventTargetUnixProcessID) ?? 0) ?? 0
+                self.handleLayoutButton(event.type, at: point, on: screen, windowID: windowID,
+                                        targetPID: pid, doubleClick: event.clickCount > 1)
+            }
+        }
+        installPointerMonitor()
         layoutChanged(wall: true)
         tick()
     }
@@ -112,6 +162,16 @@ final class DockCapture {
     func stop() {
         started = false
         removePointerMonitor()
+        if let buttonMonitor { NSEvent.removeMonitor(buttonMonitor) }
+        buttonMonitor = nil
+        layoutButtonHeld = false
+        pendingMinimizeWindow = nil
+        titlebarWindows.removeAll()
+        titlebarHoverHidden = false
+        dockProcessID = nil
+        dockInteraction = nil
+        transition = nil
+        watchWindowsUntil = 0
         autoHide = false
         magnification = false
         restoreAfter = nil
@@ -120,6 +180,7 @@ final class DockCapture {
         deadline = nil
         wallpaper = nil
         lastMetadata = nil
+        visibleWindowOwners = nil
         pauses.removeAll()
         for (center, token) in observers { center.removeObserver(token) }
         observers.removeAll()
@@ -128,12 +189,147 @@ final class DockCapture {
 
     private func pause(_ why: Pause, _ paused: Bool) {
         if paused { pauses.insert(why) } else { pauses.remove(why) }
+        layoutButtonHeld = false
+        pendingMinimizeWindow = nil
+        dockInteraction = nil
+        titlebarWindows.removeAll()
+        setTitlebarHidden(false)
         layoutChanged(wall: true, delay: 5.5)
+    }
+
+    private func beginDockTransition() {
+        let quietUntil = now + 0.8
+        transition = LayoutTransition(quietUntil: max(transition?.quietUntil ?? 0, quietUntil))
+        layoutChanged(wall: false)
+    }
+
+    private func handleLayoutButton(_ type: NSEvent.EventType, at point: CGPoint, on screen: NSScreen,
+                                    windowID: CGWindowID = 0, targetPID: pid_t = 0,
+                                    doubleClick: Bool = false) {
+        switch type {
+        case .leftMouseDown:
+            guard !(magnification && autoHide) else { return }
+            let nativeWindow = windowID != 0 && windowID == lastMetadata?.pair?.dock
+            let dockTarget = nativeWindow || (targetPID > 0 && targetPID == dockProcessID)
+            let region = dockHitRegion(on: screen)
+            // A new miniwindow to the right of the divider can already be outside
+            // the last measured shelf. The event recipient identifies the native Dock.
+            let dockPress = screen.frame.contains(point) && (dockTarget
+                ? point.y <= max(region.maxY, screen.frame.minY + estimatedShelfHeight)
+                : targetPID == 0 && lastMetadata?.windowIDs.contains(windowID) != true && region.contains(point))
+            let minimized = dockPress ? nil : minimizeWindow(at: point, on: screen, doubleClick: doubleClick)
+            guard dockPress || minimized != nil else { return }
+            if dockPress {
+                let pressedTile = CGRect(x: point.x - 12, y: point.y - 10, width: 24, height: 20)
+                let wasWaiting = dockInteraction?.waitForExit == true
+                dockInteraction = DockInteraction(originalRegion: region.union(pressedTile),
+                                                  watchUntil: now + 2.2, waitForExit: wasWaiting)
+            } else {
+                dockInteraction = nil
+            }
+            pendingMinimizeWindow = minimized
+            layoutButtonHeld = true
+        case .leftMouseUp where layoutButtonHeld:
+            layoutButtonHeld = false
+            dockInteraction?.watchUntil = now + 2.2
+        default:
+            return
+        }
+        watchWindowsUntil = max(watchWindowsUntil, now + 2.2)
+        beginDockTransition()
+    }
+
+    // Input event recipients can be the Dock's full-screen backing or a
+    // screen-sharing control. Resolve the ordered window geometry beneath them.
+    private func minimizeWindow(at point: CGPoint, on screen: NSScreen, doubleClick: Bool) -> CGWindowID? {
+        guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], 0)
+            as? [[String: Any]] else { return nil }
+        titlebarWindows = hitWindows(from: rows)
+        let quartzPoint = CGPoint(x: point.x, y: screen.frame.maxY - point.y)
+        return titlebarWindow(at: quartzPoint, doubleClick: doubleClick)?.id
+    }
+
+    private func hitWindows(from rows: [[String: Any]]) -> [HitWindow] {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+        return rows.compactMap { row in
+            guard let id = row[kCGWindowNumber as String] as? CGWindowID,
+                  let pid = row[kCGWindowOwnerPID as String] as? pid_t, pid != ownPID, pid != dockProcessID,
+                  let level = row[kCGWindowLayer as String] as? Int, level >= 0, level < dockLevel,
+                  (row[kCGWindowAlpha as String] as? Double ?? 1) > 0.05,
+                  let dict = row[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dict), !bounds.isEmpty else { return nil }
+            let eligible = level == 0 && bounds.width >= 96 && bounds.height >= 70 &&
+                NSRunningApplication(processIdentifier: pid)?.activationPolicy == .regular
+            return HitWindow(id: id, bounds: bounds, eligible: eligible)
+        }
+    }
+
+    private func titlebarWindow(at point: CGPoint, doubleClick: Bool = false) -> HitWindow? {
+        // The list is front to back. An overlying window blocks a button behind
+        // it, even if that overlying window has no standard title bar.
+        guard let window = titlebarWindows.first(where: { $0.bounds.contains(point) }),
+              window.eligible else { return nil }
+        let x = point.x - window.bounds.minX
+        let y = point.y - window.bounds.minY
+        // Include the whole controls cluster, whose position changes with unified
+        // toolbars and screen-sharing controls. A double titlebar click can also
+        // minimize a window according to the user's macOS settings.
+        guard y <= (doubleClick ? 42 : 64), doubleClick || x <= 128 else { return nil }
+        return window
+    }
+
+    private func setTitlebarHidden(_ hidden: Bool) {
+        guard titlebarHoverHidden != hidden else { return }
+        titlebarHoverHidden = hidden
+        if hidden { titlebarApproaches += 1 }
+        // A passive approach changes only presentation. The cached mask is still
+        // valid, and is reused immediately when the pointer leaves without a click.
+        onMagnificationVisibilityChange()
+    }
+
+    private func trackTitlebarPointer(on screen: NSScreen) {
+        let point = NSEvent.mouseLocation
+        let quartzPoint = CGPoint(x: point.x, y: screen.frame.maxY - point.y)
+        let candidate = titlebarWindow(at: quartzPoint)
+        setTitlebarHidden(candidate != nil)
+        if candidate != nil, !layoutButtonHeld, NSEvent.pressedMouseButtons & 1 != 0 {
+            handleLayoutButton(.leftMouseDown, at: point, on: screen)
+        }
+    }
+
+    private func installPointerMonitor() {
+        guard pointerMonitor == nil else { return }
+        pointerMonitor = NSEvent.addGlobalMonitorForEvents(matching:
+            [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.started, self.pauses.isEmpty,
+                      let screen = NSScreen.screens.first else { return }
+                self.pointerEvents += 1
+                self.trackTitlebarPointer(on: screen)
+                if self.autoHide != self.magnification { self.trackPointer(on: screen) }
+            }
+        }
+    }
+
+    private func applicationActivated() {
+        guard pauses.isEmpty else { return }
+        watchWindowsUntil = max(watchWindowsUntil, now + 1.8)
+        nextMetadata = 0
+        // A running app can be reopened with every window minimized. Activation
+        // may arrive before its first restored window appears in WindowServer.
+        let activatedPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let hadNoVisibleWindow = activatedPID.flatMap { visibleWindowOwners?.contains($0) } == false
+        if transition != nil || hadNoVisibleWindow { beginDockTransition() }
+        tick()
     }
 
     private func layoutChanged(wall: Bool, delay: TimeInterval = 0.70) {
         epoch += 1
         autoHideFrameReady = false
+        if let pending = transition {
+            transition = LayoutTransition(quietUntil: max(pending.quietUntil, now + delay))
+        }
         if wall {
             wallpaper = nil
             shelf = .zero
@@ -144,7 +340,7 @@ final class DockCapture {
             wallSettlesAfter = max(wallSettlesAfter, now + delay)
         }
         if magOnVisibleDock { shelf = .zero }
-        deadline = (magnification && autoHide) ? nil : max(now + delay, wallSettlesAfter, autoHideSettlesAfter)
+        deadline = (magnification && autoHide) ? nil : max(now + delay, wallSettlesAfter, autoHideSettlesAfter, transition?.quietUntil ?? 0)
         nextMetadata = 0
         if hidesOverlayForMagnification { status = "native Dock (magnification)" }
         else { status = pauses.isEmpty ? "waiting for settled Dock" : "paused" }
@@ -181,19 +377,8 @@ final class DockCapture {
         magnification = magnifies
         autoHide = hides
         autoHideSettlesAfter = 0
-        removePointerMonitor()
-        if autoHide != magnification {
-            readDockGeometry()
-            // The native animation begins between presentation ticks. Hide on
-            // the pointer event itself; this path never requests a screenshot.
-            pointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    guard let self, self.started, self.pauses.isEmpty,
-                          let screen = NSScreen.screens.first else { return }
-                    self.trackPointer(on: screen)
-                }
-            }
-        }
+        readDockGeometry()
+        installPointerMonitor()
         layoutChanged(wall: true)
         restoreAfter = nil
         if let screen = NSScreen.screens.first { trackPointer(on: screen) }
@@ -213,8 +398,7 @@ final class DockCapture {
         onMagnificationVisibilityChange()
     }
 
-    private func trackPointer(on screen: NSScreen, mayRestore: Bool = false) {
-        let point = NSEvent.mouseLocation
+    private func dockHitRegion(on screen: NSScreen) -> CGRect {
         var region = shelf.isEmpty
             ? CGRect(x: screen.frame.minX, y: screen.frame.minY, width: screen.frame.width,
                      height: magOnVisibleDock ? max(estimatedShelfHeight, largeTileSize + 16) : estimatedShelfHeight)
@@ -225,6 +409,12 @@ final class DockCapture {
             region = region.insetBy(dx: -max(0, largeTileSize - tileSize), dy: 0)
             region.size.height = max(region.height, screen.frame.minY + largeTileSize + 16 - region.minY)
         }
+        return region
+    }
+
+    private func trackPointer(on screen: NSScreen, mayRestore: Bool = false) {
+        let point = NSEvent.mouseLocation
+        let region = dockHitRegion(on: screen)
         let atRevealEdge = autoHide && screen.frame.contains(point) && point.y - screen.frame.minY < 3 &&
             point.x >= region.minX && point.x <= region.maxX
         let overDock = (screen.frame.contains(point) && region.contains(point)) || atRevealEdge
@@ -279,17 +469,23 @@ final class DockCapture {
     private func metadata(on display: CGDirectDisplayID) -> Metadata? {
         guard let owner = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier,
               let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, 0) as? [[String: Any]] else { return nil }
+        dockProcessID = owner
+        titlebarWindows = hitWindows(from: list)
         let bounds = CGDisplayBounds(display)
         let desktop = Int(CGWindowLevelForKey(.desktopWindow))
         let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
         var native: CGWindowID?, wall: CGWindowID?
         var windows: Set<CGWindowID> = []
+        var owners: Set<pid_t> = []
         for row in list {
             guard let id = row[kCGWindowNumber as String] as? CGWindowID,
                   let level = row[kCGWindowLayer as String] as? Int,
                   let dict = row[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: dict) else { continue }
-            if level == 0, rect.width >= 96, rect.height >= 70 { windows.insert(id) }
+            if level == 0, rect.width >= 96, rect.height >= 70 {
+                windows.insert(id)
+                if let pid = row[kCGWindowOwnerPID as String] as? pid_t { owners.insert(pid) }
+            }
             guard row[kCGWindowOwnerPID as String] as? pid_t == owner,
                   abs(rect.minX-bounds.minX) <= 1, abs(rect.minY-bounds.minY) <= 1,
                   abs(rect.width-bounds.width) <= 1, abs(rect.height-bounds.height) <= 1 else { continue }
@@ -298,6 +494,7 @@ final class DockCapture {
                 wall = id
             }
         }
+        visibleWindowOwners = owners
         var pair: Pair?
         if let native, let wall { pair = Pair(display: display, dock: native, wallpaper: wall, bounds: bounds) }
         return Metadata(pair: pair, windowIDs: windows, dockConfig: modification(dockPrefs), wallpaperConfig: modification(wallPrefs))
@@ -312,7 +509,12 @@ final class DockCapture {
               let screen = NSScreen.screens.first,
               let display = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value else { return }
         let time = now
-        if time >= nextMetadata {
+        if layoutButtonHeld && NSEvent.pressedMouseButtons & 1 == 0 {
+            handleLayoutButton(.leftMouseUp, at: NSEvent.mouseLocation, on: screen)
+        }
+        let verifyingNow = transition != nil && !layoutButtonHeld && dockInteraction?.waitForExit != true &&
+            (pendingMinimizeWindow == nil || time >= watchWindowsUntil) && time >= (deadline ?? .infinity)
+        if time >= nextMetadata || verifyingNow {
             let allowed = CGPreflightScreenCaptureAccess()
             let current = allowed ? metadata(on: display) : nil
             let old = lastMetadata
@@ -320,14 +522,39 @@ final class DockCapture {
             if (autoHide || magnification) && (old == nil || current?.dockConfig != old?.dockConfig) { readDockGeometry() }
             if permission != allowed || current?.pair != old?.pair || current?.wallpaperConfig != old?.wallpaperConfig {
                 layoutChanged(wall: true)
-            } else if current?.windowIDs != old?.windowIDs || current?.dockConfig != old?.dockConfig {
+            } else if current?.windowIDs != old?.windowIDs {
+                if let interaction = dockInteraction, (layoutButtonHeld || time <= interaction.watchUntil),
+                   interaction.originalRegion.contains(NSEvent.mouseLocation) {
+                    // A miniwindow was inserted or removed while the pointer was
+                    // still over the old tiles. Dock can shift them again on exit.
+                    dockInteraction?.waitForExit = true
+                }
+                beginDockTransition()
+            } else if current?.dockConfig != old?.dockConfig {
                 layoutChanged(wall: false)
             }
             permission = allowed
-            nextMetadata = time + 3
+            nextMetadata = time + (time < watchWindowsUntil ? 0.35 : 3)
         }
+        trackTitlebarPointer(on: screen)
         trackPointer(on: screen, mayRestore: true)
-        guard permission, !inFlight, !hidesOverlayForMagnification, !autoHide || hovering, let deadline, time >= deadline,
+        if let interaction = dockInteraction {
+            if interaction.waitForExit {
+                guard !interaction.originalRegion.contains(NSEvent.mouseLocation) else { return }
+                dockInteraction = nil
+                beginDockTransition()
+                return
+            } else if !layoutButtonHeld && time >= interaction.watchUntil {
+                dockInteraction = nil
+            }
+        }
+        if let pendingMinimizeWindow {
+            // NSWindow can remain onscreen as its sheet shrinks. A click can also
+            // be cancelled, so snapshot again after a bounded wait in that case.
+            if time < watchWindowsUntil && lastMetadata?.windowIDs.contains(pendingMinimizeWindow) == true { return }
+            self.pendingMinimizeWindow = nil
+        }
+        guard permission, !layoutButtonHeld, !inFlight, !hidesOverlayForInteraction, !autoHide || hovering, let deadline, time >= deadline,
               let pair = lastMetadata?.pair, pair.display == display else { return }
         self.deadline = nil
         inFlight = true
@@ -368,18 +595,46 @@ final class DockCapture {
                 let dock = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: dockWindow), configuration: config)
                 guard self.canFinishCapture(token, on: screen), let wallpaper = self.wallpaper else { return }
                 self.dockUpdates += 1
+                if self.transition != nil {
+                    let shape = await DockLayoutSample.geometry(of: dock, wallpaper: wallpaper, scale: scale)
+                    guard self.canFinishCapture(token, on: screen), self.layoutIsStable(shape) else { return }
+                }
                 self.status = "on-demand snapshots"
                 self.update(dock, wallpaper, screen, area)
             } catch {
                 // Keep the real Dock visible. The next actual layout change retries.
-                if self.epoch == token { self.status = "snapshot unavailable" }
+                if self.epoch == token {
+                    if self.transition != nil { _ = self.layoutIsStable(nil) }
+                    else { self.status = "snapshot unavailable" }
+                }
             }
         }
+    }
+
+    // Two successive Dock-only samples must agree before the cached artwork can
+    // be placed between tiles again. A continuously changing Dock stays native.
+    private func layoutIsStable(_ shape: Data?) -> Bool {
+        guard var pending = transition else { return true }
+        if let shape, pending.previousShape == shape {
+            transition = nil
+            return true
+        }
+        pending.previousShape = shape
+        pending.samples += 1
+        transition = pending
+        if pending.samples < 8 {
+            deadline = now + (pending.samples < 4 ? 0.18 : 1.3)
+            status = "checking Dock layout"
+        } else {
+            deadline = nil
+            status = "native Dock while layout is changing"
+        }
+        return false
     }
 
     private func canFinishCapture(_ token: Int, on screen: NSScreen) -> Bool {
         refreshMode()
         if magOnVisibleDock { trackPointer(on: screen) }
-        return started && epoch == token && !hidesOverlayForMagnification
+        return started && epoch == token && !layoutButtonHeld && !hidesOverlayForMagnification
     }
 }

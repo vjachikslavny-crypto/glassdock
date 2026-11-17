@@ -112,7 +112,14 @@ enum DockMask {
         guard let (top,bottom) = best else { return nil }
         let height = bottom.row-top.row
         let r = Double(height)*0.25
-        let edgeStart = max(top.first,bottom.first), edgeEnd = min(top.last,bottom.last)
+        // A badge can split one horizontal edge into shorter runs. The two edges
+        // already passed the overlap test, so use the intact longer edge to search
+        // for the side walls instead of trimming the shelf to the interrupted run.
+        let topSpan = top.last - top.first, bottomSpan = bottom.last - bottom.first
+        let intact = topSpan > bottomSpan ? top : bottom
+        let interrupted = abs(topSpan - bottomSpan) > Int(6 * scale)
+        let edgeStart = interrupted ? intact.first : max(top.first, bottom.first)
+        let edgeEnd = interrupted ? intact.last : min(top.last, bottom.last)
         let middle = (top.row + bottom.row)/2
         let search = Int(2*r+6*scale)
         let hop = max(1,Int(scale.rounded()))
@@ -139,6 +146,13 @@ enum DockMask {
         let left=side(at:edgeStart,left:true), right=side(at:edgeEnd,left:false)
         guard right-left > minWidth else { return nil }
         return Shelf(left:left,right:right,top:top.row,bottom:bottom.row,radius:r)
+    }
+
+    private struct ClassifiedMask {
+        let pixels: [UInt8]
+        let width: Int
+        let height: Int
+        let shelf: CGRect
     }
 
     // Take median colours along bands near the top and bottom of the fill. Those bands
@@ -178,14 +192,12 @@ enum DockMask {
         return result
     }
 
-    static func compose(dock: CGImage, wallpaper: CGImage, scale: CGFloat,
-                        onShelf: ((CGRect) -> Void)? = nil) -> CGImage? {
-        guard dock.width==wallpaper.width, dock.height==wallpaper.height,
-              dock.width>16, dock.height>12, dock.width<=16384, dock.height<=1024,
-              scale.isFinite, scale>=0.5, scale<=4,
-              let colorSpace=CGColorSpace(name:CGColorSpace.sRGB),
-              let frame=Raster(dock,space:colorSpace), let shelf=findShelf(frame,scale:scale),
-              let paper=Raster(wallpaper,space:colorSpace) else { return nil }
+    private static func classify(_ dock: CGImage, scale: CGFloat) -> ClassifiedMask? {
+        guard dock.width > 16, dock.height > 12, dock.width <= 16384, dock.height <= 1024,
+              scale.isFinite, scale >= 0.5, scale <= 4,
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let frame = Raster(dock, space: colorSpace),
+              let shelf = findShelf(frame, scale: scale) else { return nil }
         let inner = max(3,Int(2.5*scale)), outer = max(2,Int(2*scale))
         let bandTop=shelf.top+inner, bandBottom=shelf.bottom-inner
         guard bandTop < bandBottom else { return nil }
@@ -253,29 +265,24 @@ enum DockMask {
         let clearSamples = stride(from: 0, to: w, by: max(1,w/24)).filter { frame.bytes[frame.index($0,0)+3] < 4 }.count
         let hasIsolatedMaterial = clearSamples >= 5 && lower[lower.count/2][3] < 240
         if hasIsolatedMaterial {
-            // The isolated window carries the exact alpha of the shelf, the shadow and
-            // each tile. The shadow reaches well beyond the geometric rounded rectangle.
-            // Only its black ink is eligible outside the rim so animation and tooltips
-            // passing through the same band keep their coloured and opaque pixels.
-            let shadowReach = Int(96*scale)
-            let minX = max(0, shelf.left-shadowReach), maxX = min(w-1, shelf.right+shadowReach)
-            let minY = max(0, shelf.top-shadowReach), maxY = min(h-1, shelf.bottom+shadowReach)
+            // Confine the patch to the rounded shelf and its hairline. Opaque wallpaper
+            // over the native shadow would also cover windows animating through it.
             let rimTolerance = Int(7*scale)
-            for y in minY...maxY {
+            for y in top...bottom {
                 let yDist = min(y-shelf.top, shelf.bottom-y)
                 let cornerY = max(0, shelf.radius - Double(max(0,yDist)))
                 let cornerInset = Int(shelf.radius - sqrt(max(0,shelf.radius*shelf.radius - cornerY*cornerY)))
                 let sideL = shelf.left+cornerInset, sideR = shelf.right-cornerInset
-                for x in minX...maxX {
+                for x in left...right {
                     let k=y*w+x, i=k*4, alpha=Int(frame.bytes[i+3])
                     guard alpha > 0 else { mask[k]=0; continue }
                     let xDist = min(x-sideL,sideR-x)
+                    guard xDist >= -outer else { mask[k]=0; continue }
                     if (xDist < 0 || yDist < 0), alpha < 180,
                        frame.bytes[i] <= 1, frame.bytes[i+1] <= 1, frame.bytes[i+2] <= 1 {
-                        mask[k]=2; continue
+                        mask[k]=0; continue
                     }
-                    guard yDist >= -rimTolerance, xDist >= -rimTolerance,
-                          min(yDist,xDist) <= rimTolerance else { continue }
+                    guard min(yDist,xDist) <= rimTolerance else { continue }
                     let j=max(0,min(upper.count-1,x-shelf.left))
                     let floorAlpha = max(upper[j][3],lower[j][3])
                     // The pale outline is only a little more opaque than the fill.
@@ -303,17 +310,47 @@ enum DockMask {
                 }
             }
         }
-        var output=[UInt8](repeating:0,count:4*w*h)
-        output.withUnsafeMutableBytes { out in
-            paper.bytes.withUnsafeBytes { input in
-                let dest=out.bindMemory(to:UInt32.self), src=input.bindMemory(to:UInt32.self)
-                for index in mask.indices where mask[index]==2 { dest[index]=src[index] }
+        return ClassifiedMask(pixels: mask, width: w, height: h,
+                              shelf: CGRect(x: shelf.left, y: shelf.top,
+                                            width: shelf.right - shelf.left + 1,
+                                            height: shelf.bottom - shelf.top + 1))
+    }
+
+    // Compare the actual wallpaper coverage at native resolution. Alpha bands in
+    // the Dock itself miss fading miniwindows and moving tiles on an opaque shelf.
+    static func occupancy(of dock: CGImage, scale: CGFloat) -> Data? {
+        guard let mask = classify(dock, scale: scale) else { return nil }
+        let header = 2 * MemoryLayout<UInt32>.size
+        var signature = Data(count: header + (mask.pixels.count + 7) / 8)
+        signature.withUnsafeMutableBytes { (bytes: UnsafeMutableRawBufferPointer) in
+            bytes.storeBytes(of: UInt32(mask.width).bigEndian, toByteOffset: 0, as: UInt32.self)
+            bytes.storeBytes(of: UInt32(mask.height).bigEndian, toByteOffset: 4, as: UInt32.self)
+            let bits = bytes.bindMemory(to: UInt8.self)
+            for index in mask.pixels.indices where mask.pixels[index] == 2 {
+                bits[header + index / 8] |= UInt8(1 << (index % 8))
             }
         }
-        guard let provider=CGDataProvider(data: Data(output) as CFData) else { return nil }
-        onShelf?(CGRect(x:shelf.left, y:shelf.top, width:shelf.right-shelf.left+1, height:shelf.bottom-shelf.top+1))
-        return CGImage(width:w,height:h,bitsPerComponent:8,bitsPerPixel:32,bytesPerRow:4*w,
-                       space:colorSpace,bitmapInfo:format,provider:provider,decode:nil,shouldInterpolate:false,
-                       intent:.defaultIntent)
+        return signature
+    }
+
+    static func compose(dock: CGImage, wallpaper: CGImage, scale: CGFloat,
+                        onShelf: ((CGRect) -> Void)? = nil) -> CGImage? {
+        guard dock.width == wallpaper.width, dock.height == wallpaper.height,
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let mask = classify(dock, scale: scale),
+              let paper = Raster(wallpaper, space: colorSpace) else { return nil }
+        let w = mask.width, h = mask.height
+        var output = [UInt8](repeating: 0, count: 4 * w * h)
+        output.withUnsafeMutableBytes { out in
+            paper.bytes.withUnsafeBytes { input in
+                let dest = out.bindMemory(to: UInt32.self), src = input.bindMemory(to: UInt32.self)
+                for index in mask.pixels.indices where mask.pixels[index] == 2 { dest[index] = src[index] }
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(output) as CFData) else { return nil }
+        onShelf?(mask.shelf)
+        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 4 * w,
+                       space: colorSpace, bitmapInfo: format, provider: provider, decode: nil,
+                       shouldInterpolate: false, intent: .defaultIntent)
     }
 }
