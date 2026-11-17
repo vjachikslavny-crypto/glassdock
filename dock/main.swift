@@ -2,7 +2,7 @@ import AppKit
 import CoreGraphics
 import ServiceManagement
 
-private let appName = "GlassDock Dock"
+private let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "GlassDock"
 private let outputLevel = CGWindowLevelForKey(.dockWindow) + 1
 
 private final class GlassPanel: NSPanel {
@@ -58,8 +58,8 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
             start()
         } else {
             // Ask exactly on the first interactive launch. macOS owns the grant prompt.
-            if !UserDefaults.standard.bool(forKey: "didRequestCapture") {
-                UserDefaults.standard.set(true, forKey: "didRequestCapture")
+            if !UserDefaults.standard.bool(forKey: "didRequestCaptureAsGlassDock") {
+                UserDefaults.standard.set(true, forKey: "didRequestCaptureAsGlassDock")
                 _ = CGRequestScreenCaptureAccess()
             }
             waitForPermission()
@@ -191,8 +191,10 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
         guard wasHovering else { return clippedRegions }
         // A cached shadow patch can cover the Dock's live title above a tile.
         // Leave that band to the native Dock while the pointer is over the shelf.
-        let titleBand = CGRect(x: 0, y: shelf.maxY - area.minY + 2,
-                               width: area.width, height: max(0, area.maxY - shelf.maxY - 2))
+        let labelWidth = min(420, area.width)
+        let x = min(max(0, NSEvent.mouseLocation.x - area.minX - labelWidth / 2), area.width - labelWidth)
+        let titleBand = CGRect(x: x, y: shelf.maxY - area.minY + 6,
+                               width: labelWidth, height: max(0, area.maxY - shelf.maxY - 6))
         return titleBand.isEmpty ? clippedRegions : clippedRegions + [titleBand]
     }
 

@@ -17,7 +17,7 @@ def app(directory, name, executable, identifier, binary, background=True, build=
     target = result / "Contents" / "MacOS"
     target.mkdir(parents=True)
     shutil.copy2(binary, target / executable)
-    info = {"CFBundleName": name, "CFBundleExecutable": executable,
+    info = {"CFBundleName": name, "CFBundleDisplayName": name, "CFBundleExecutable": executable,
             "CFBundleIdentifier": identifier, "CFBundleVersion": build,
             "CFBundlePackageType": "APPL", "LSUIElement": background}
     with (result / "Contents/Info.plist").open("wb") as f:
@@ -52,10 +52,11 @@ private enum Checks {
         }
         do {
             try await checkState([], "Clean launch")
-            let installedDock = URL(fileURLWithPath: ProcessInfo.processInfo.environment["TEST_MANAGED_DOCK"]!)
+            let legacyDock = URL(fileURLWithPath: ProcessInfo.processInfo.environment["TEST_LEGACY_DOCK"]!)
+            let installedDock = legacyDock.deletingLastPathComponent().appendingPathComponent("GlassDock.app", isDirectory: true)
             let open = NSWorkspace.OpenConfiguration()
             open.activates = false
-            let previousDock = try await NSWorkspace.shared.openApplication(at: installedDock, configuration: open)
+            let previousDock = try await NSWorkspace.shared.openApplication(at: legacyDock, configuration: open)
             try await checkState([.dock], "Old Dock active when opening the new controller")
             await controls.set(.dock, to: false)
             try await checkState([], "Stop old Dock")
@@ -65,6 +66,8 @@ private enum Checks {
             try await checkState([.menu, .dock], "Both together")
             let liveDock = Effect.dock.runningApps().first
             try require(liveDock?.processIdentifier != previousDock.processIdentifier, "Dock must restart")
+            try require(liveDock?.bundleURL?.standardizedFileURL.path == installedDock.standardizedFileURL.path, "Launch the managed GlassDock.app")
+            try require(liveDock?.localizedName == "GlassDock", "System display name must be GlassDock")
             let installedInfo = try Data(contentsOf: installedDock.appendingPathComponent("Contents/Info.plist"))
             let plist = try PropertyListSerialization.propertyList(from: installedInfo, format: nil) as? [String: Any]
             try require(plist?["CFBundleVersion"] as? String == "3", "Replace managed Dock build 2 with build 3")
@@ -120,17 +123,20 @@ with tempfile.TemporaryDirectory(prefix="glassdock-integration-") as scratch:
     run("swiftc", "-parse-as-library", str(root / "TestController.swift"), "-o", str(root / "Controller"))
     controller = app(root, "Test Controller", "Controller", namespace + ".controller", root / "Controller")
     bundled = controller / "Contents/Helpers"
-    for name, effect in (("Sheer", "menu"), ("GlassDock Dock", "dock")):
+    for name, effect in (("Sheer", "menu"), ("GlassDock", "dock")):
         demo = app(bundled, name, "Dummy", namespace + "." + effect, root / "IdleHelper",
                    build="3" if effect == "dock" else "1")
         run("codesign", "--force", "--sign", "-", str(demo))
     previous = app(root / "managed", "GlassDock Dock", "Dummy", namespace + ".dock",
                    root / "IdleHelper", build="2")
+    cached = app(root / "managed", "GlassDock", "Dummy", namespace + ".dock",
+                 root / "IdleHelper", build="2")
+    run("codesign", "--force", "--sign", "-", str(cached))
     run("codesign", "--force", "--sign", "-", str(previous))
     run("codesign", "--force", "--sign", "-", str(controller))
     try:
         run(str(controller / "Contents/MacOS/Controller"), timeout=55,
-            env={**os.environ, "TEST_MANAGED_DOCK": str(previous)})
+            env={**os.environ, "TEST_LEGACY_DOCK": str(previous)})
     finally:
         # Only the two binaries underneath this run's random temp directory may
         # be terminated during cleanup, even when the test timed out or crashed.
@@ -139,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix="glassdock-integration-") as scratch:
             if len(line.split(None, 1)) != 2:
                 continue
             pid, executable = line.split(None, 1)
-            for helper in ("Sheer", "GlassDock Dock"):
+            for helper in ("Sheer", "GlassDock", "GlassDock Dock"):
                 expected = root / "managed" / (helper + ".app") / "Contents/MacOS/Dummy"
                 if executable == str(expected):
                     try:

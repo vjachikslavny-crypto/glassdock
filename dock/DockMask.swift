@@ -300,6 +300,24 @@ enum DockMask {
                     }
                 }
             }
+            // Neutralize only the shelf's measured black drop shadow. Encode its
+            // opacity separately so composition can lift the underlying desktop
+            // by the amount it was darkened, without pasting an opaque halo.
+            let reach = Int(64 * scale)
+            for y in max(0, shelf.top - reach)...min(h - 1, shelf.bottom + reach) {
+                let edge = max(0, shelf.radius - Double(max(0, min(y - shelf.top, shelf.bottom - y))))
+                let curve = Int(shelf.radius - sqrt(max(0, shelf.radius * shelf.radius - edge * edge)))
+                for x in max(0, shelf.left - reach)...min(w - 1, shelf.right + reach) {
+                    guard y <= shelf.top + outer || y >= shelf.bottom - outer ||
+                          x <= shelf.left + curve + outer || x >= shelf.right - curve - outer else { continue }
+                    let k = y * w + x, i = k * 4
+                    let alpha = frame.bytes[i + 3]
+                    if alpha >= 4 && alpha <= 96 && frame.bytes[i] == 0 &&
+                       frame.bytes[i + 1] == 0 && frame.bytes[i + 2] == 0 {
+                        mask[k] = alpha
+                    }
+                }
+            }
         } else if xGuardMin <= xGuardMax && bandTop+inset < bandBottom-inset {
             for x in xGuardMin...xGuardMax {
                 if mask[bandTop*w+x] != 2 && mask[(bandTop+inset)*w+x] != 2 {
@@ -326,7 +344,7 @@ enum DockMask {
             bytes.storeBytes(of: UInt32(mask.width).bigEndian, toByteOffset: 0, as: UInt32.self)
             bytes.storeBytes(of: UInt32(mask.height).bigEndian, toByteOffset: 4, as: UInt32.self)
             let bits = bytes.bindMemory(to: UInt8.self)
-            for index in mask.pixels.indices where mask.pixels[index] == 2 {
+            for index in mask.pixels.indices where mask.pixels[index] >= 2 {
                 bits[header + index / 8] |= UInt8(1 << (index % 8))
             }
         }
@@ -344,7 +362,29 @@ enum DockMask {
         output.withUnsafeMutableBytes { out in
             paper.bytes.withUnsafeBytes { input in
                 let dest = out.bindMemory(to: UInt32.self), src = input.bindMemory(to: UInt32.self)
-                for index in mask.pixels.indices where mask.pixels[index] == 2 { dest[index] = src[index] }
+                let outputBytes = out.bindMemory(to: UInt8.self)
+                for index in mask.pixels.indices {
+                    let value = mask.pixels[index]
+                    if value == 2 {
+                        dest[index] = src[index]
+                    } else if value >= 4 {
+                        let i = index * 4
+                        guard paper.bytes[i + 3] == 255 else { continue }
+                        let peak = Int(max(paper.bytes[i], paper.bytes[i + 1], paper.bytes[i + 2]))
+                        let shadow = Double(value) / 255
+                        // Solve source-over against B*(1-shadow) to recover B.
+                        // Limit coverage so a bright desktop cannot turn a faint
+                        // moving shadow into an opaque strip during a transition.
+                        let loss = Double(peak) * shadow
+                        let opacity = min(128, max(1, Int(ceil(255 * loss / max(1, 255 - Double(peak) + loss)))))
+                        for c in 0..<3 {
+                            let channel = Double(paper.bytes[i + c])
+                            let color = channel * (Double(opacity)/255 + shadow * (1 - Double(opacity)/255))
+                            outputBytes[i + c] = UInt8(min(opacity, Int(color.rounded())))
+                        }
+                        outputBytes[i + 3] = UInt8(opacity)
+                    }
+                }
             }
         }
         guard let provider = CGDataProvider(data: Data(output) as CFData) else { return nil }

@@ -89,6 +89,7 @@ final class DockCapture {
     private struct Metadata {
         let pair: Pair?
         let windowIDs: Set<CGWindowID>
+        let shadows: [DockBackdrop.Window]
         let dockConfig: Date?
         let wallpaperConfig: Date?
     }
@@ -474,6 +475,9 @@ final class DockCapture {
         let bounds = CGDisplayBounds(display)
         let desktop = Int(CGWindowLevelForKey(.desktopWindow))
         let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+        let strip = CGRect(x: bounds.minX, y: max(bounds.minY, bounds.maxY - 150), width: bounds.width, height: min(150, bounds.height))
+        let activeOwner = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        var shadows: [DockBackdrop.Window] = []
         var native: CGWindowID?, wall: CGWindowID?
         var windows: Set<CGWindowID> = []
         var owners: Set<pid_t> = []
@@ -482,6 +486,10 @@ final class DockCapture {
                   let level = row[kCGWindowLayer as String] as? Int,
                   let dict = row[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: dict) else { continue }
+            if (0..<dockLevel).contains(level), !rect.isEmpty, DockBackdrop.nearby(rect, strip: strip),
+               (row[kCGWindowAlpha as String] as? Double ?? 1) > 0 {
+                shadows.append(DockBackdrop.Window(id: id, frame: rect, activeOwner: (row[kCGWindowOwnerPID as String] as? pid_t) == activeOwner))
+            }
             if level == 0, rect.width >= 96, rect.height >= 70 {
                 windows.insert(id)
                 if let pid = row[kCGWindowOwnerPID as String] as? pid_t { owners.insert(pid) }
@@ -497,7 +505,7 @@ final class DockCapture {
         visibleWindowOwners = owners
         var pair: Pair?
         if let native, let wall { pair = Pair(display: display, dock: native, wallpaper: wall, bounds: bounds) }
-        return Metadata(pair: pair, windowIDs: windows, dockConfig: modification(dockPrefs), wallpaperConfig: modification(wallPrefs))
+        return Metadata(pair: pair, windowIDs: windows, shadows: shadows, dockConfig: modification(dockPrefs), wallpaperConfig: modification(wallPrefs))
     }
 
     // Called by the application's existing presentation timer. Only layout events
@@ -518,6 +526,8 @@ final class DockCapture {
             let allowed = CGPreflightScreenCaptureAccess()
             let current = allowed ? metadata(on: display) : nil
             let old = lastMetadata
+            let shadowsChanged = current?.shadows != old?.shadows
+            if shadowsChanged { wallpaper = nil }
             lastMetadata = current
             if (autoHide || magnification) && (old == nil || current?.dockConfig != old?.dockConfig) { readDockGeometry() }
             if permission != allowed || current?.pair != old?.pair || current?.wallpaperConfig != old?.wallpaperConfig {
@@ -530,7 +540,7 @@ final class DockCapture {
                     dockInteraction?.waitForExit = true
                 }
                 beginDockTransition()
-            } else if current?.dockConfig != old?.dockConfig {
+            } else if shadowsChanged || current?.dockConfig != old?.dockConfig {
                 layoutChanged(wall: false)
             }
             permission = allowed
@@ -554,7 +564,7 @@ final class DockCapture {
             if time < watchWindowsUntil && lastMetadata?.windowIDs.contains(pendingMinimizeWindow) == true { return }
             self.pendingMinimizeWindow = nil
         }
-        guard permission, !layoutButtonHeld, !inFlight, !hidesOverlayForInteraction, !autoHide || hovering, let deadline, time >= deadline,
+        guard permission, !layoutButtonHeld, NSEvent.pressedMouseButtons & 1 == 0, !inFlight, !hidesOverlayForInteraction, !autoHide || hovering, let deadline, time >= deadline,
               let pair = lastMetadata?.pair, pair.display == display else { return }
         self.deadline = nil
         inFlight = true
@@ -587,8 +597,18 @@ final class DockCapture {
                 config.includeChildWindows = false
                 config.colorSpaceName = CGColorSpace.sRGB
                 if self.wallpaper == nil {
-                    let wall = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: wallWindow), configuration: config)
+                    guard let desktop = available.displays.first(where: { $0.displayID == display }),
+                          let shadows = self.lastMetadata?.shadows,
+                          let wall = try await DockBackdrop.capture(display: desktop, wallpaper: wallWindow,
+                              windows: shadows, available: available.windows,
+                              strip: local.offsetBy(dx: pair.bounds.minX, dy: pair.bounds.minY), scale: scale,
+                              isCurrent: { self.canFinishCapture(token, on: screen) }) else { return }
                     guard self.canFinishCapture(token, on: screen) else { return }
+                    // A window can move while the cropped desktop images are in flight.
+                    guard self.metadata(on: display)?.shadows == shadows else {
+                        self.layoutChanged(wall: false)
+                        return
+                    }
                     self.wallpaper = wall
                     self.wallpaperUpdates += 1
                 }

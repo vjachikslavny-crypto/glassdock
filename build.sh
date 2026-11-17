@@ -7,8 +7,8 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 version=$(cat VERSION)
 app="$stage/image/GlassDock.app"
-helper="$app/Contents/Helpers/GlassDock Dock.app"
-mkdir -p "$app/Contents/"{MacOS,Resources,Helpers,Library/LaunchAgents} "$helper/Contents/MacOS" "$stage/upper"
+helper="$app/Contents/Helpers/GlassDock.app"
+mkdir -p "$app/Contents/"{MacOS,Resources,Helpers,Library/LaunchAgents} "$helper/Contents/"{MacOS,Resources} "$stage/upper"
 
 build_universal() {
     local binary=$1 name=$2
@@ -20,6 +20,8 @@ build_universal() {
     xcrun lipo -create "$stage/$name-arm64" "$stage/$name-x86_64" -output "$binary"
 }
 
+swift art/MakeIcon.swift "$app/Contents/Resources/GlassDock.icns"
+cp "$app/Contents/Resources/GlassDock.icns" "$helper/Contents/Resources/"
 cp dock/Info.plist "$helper/Contents/"
 build_universal "$helper/Contents/MacOS/DockGlass" DockGlass dock/*.swift
 codesign --force --sign - "$helper"
@@ -31,7 +33,6 @@ cp app/Info.plist "$app/Contents/"
 /usr/bin/plutil -replace CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
 /usr/bin/plutil -replace CFBundleIconFile -string GlassDock "$app/Contents/Info.plist"
 cp app/app.glassdock.restore.plist "$app/Contents/Library/LaunchAgents/"
-swift art/MakeIcon.swift "$app/Contents/Resources/GlassDock.icns"
 build_universal "$app/Contents/MacOS/GlassDock" GlassDockLauncher -parse-as-library app/*.swift
 codesign --force --sign - "$app"
 codesign --verify --all-architectures --deep --strict "$app"

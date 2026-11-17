@@ -11,7 +11,7 @@ private enum Effect: String, CaseIterable, Identifiable {
     case menu, dock
     var id: Self { self }
     var title: String { self == .menu ? tr("Строка меню", "Menu bar") : "Dock" }
-    var helper: String { self == .menu ? "Sheer" : "GlassDock Dock" }
+    var helper: String { self == .menu ? "Sheer" : "GlassDock" }
     var bundleID: String { self == .menu ? "io.github.sheer.Sheer" : "local.mac.dockglass" }
     var preference: String { "Restore." + rawValue }
     var supported: Bool { self != .menu || ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 26 }
@@ -37,14 +37,13 @@ private enum Helpers {
         return FileManager.default.isExecutableFile(atPath: executable.path)
     }
 
-    // A previously installed helper retains its identity and permission grants.
-    // The managed copy is independent of the enclosing app and of Sheer's updater.
+    // Reuse standalone Sheer with its own permissions and updater.
+    // The Dock always launches from the branded, versioned copy we ship.
     static func application(for effect: Effect) throws -> URL {
         let files = FileManager.default
-        let names = effect == .dock ? ["Прозрачный Dock.app", "GlassDock Dock.app"] : ["Sheer.app"]
-        for directory in files.urls(for: .applicationDirectory, in: [.userDomainMask, .localDomainMask]) {
-            for name in names {
-                let url = directory.appendingPathComponent(name, isDirectory: true)
+        if effect == .menu {
+            for directory in files.urls(for: .applicationDirectory, in: [.userDomainMask, .localDomainMask]) {
+                let url = directory.appendingPathComponent("Sheer.app", isDirectory: true)
                 if matches(effect, at: url) { return url }
             }
         }
