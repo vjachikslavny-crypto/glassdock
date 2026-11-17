@@ -117,13 +117,21 @@ private enum Helpers {
 private final class Controls: ObservableObject {
     @Published var running: Set<Effect> = []
     @Published var busy: Set<Effect> = []
+    @Published private(set) var showMagnificationHelp = false
     @Published var loginEnabled = false
     @Published var loginNeedsApproval = false
     @Published var failure: String?
     private let service = SMAppService.agent(plistName: "app.glassdock.restore.plist")
 
+    func refreshMagnification() {
+        let showHelp = running.contains(.dock) && CFPreferencesGetAppBooleanValue(
+            "magnification" as CFString, "com.apple.dock" as CFString, nil)
+        if showMagnificationHelp != showHelp { showMagnificationHelp = showHelp }
+    }
+
     func refresh() {
         running = Set(Effect.allCases.filter { !$0.runningApps().isEmpty })
+        refreshMagnification()
         let status = service.status
         loginEnabled = status == .enabled || status == .requiresApproval
         loginNeedsApproval = status == .requiresApproval
@@ -203,6 +211,19 @@ private struct ControlView: View {
                         .accessibilityIdentifier(effect.rawValue + "-toggle")
                     }
                     .padding(.horizontal, 16).padding(.vertical, 15)
+                    if effect == .dock && controls.showMagnificationHelp {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(tr("При наведении появляется обычный фон Dock. Когда уберёшь курсор и значки уменьшатся, прозрачность вернётся. Чтобы сохранить её и при наведении, выключи увеличение в настройках Dock.",
+                                    "Hover over the Dock to see its usual background. Move the pointer away and transparency returns once the icons shrink. To keep it transparent on hover too, turn off Magnification in Dock settings."))
+                                .font(.callout).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Link(tr("Открыть настройки Dock…", "Open Dock settings…"),
+                                 destination: URL(string: "x-apple.systempreferences:com.apple.Desktop-Settings.extension?Dock")!)
+                                .buttonStyle(.link)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, 64).padding(.trailing, 16).padding(.bottom, 15)
+                    }
                 }
             }
             .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
@@ -229,6 +250,9 @@ private struct ControlView: View {
         .padding(24)
         .frame(width: 480)
         .onAppear { controls.refresh() }
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            controls.refreshMagnification()
+        }
         .onChange(of: scenePhase) { _, phase in if phase == .active { controls.refresh() } }
         .onReceive(activity.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in controls.refresh() }
         .onReceive(activity.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in controls.refresh() }

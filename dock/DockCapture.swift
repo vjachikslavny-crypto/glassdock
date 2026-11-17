@@ -8,6 +8,7 @@ import ScreenCaptureKit
 final class DockCapture {
     typealias Update = (CGImage?, CGImage?, NSScreen?, CGRect) -> Void
     private let update: Update
+    private let onMagnificationVisibilityChange: () -> Void
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
     private enum Pause { case system, display, session }
     private var pauses: Set<Pause> = []
@@ -17,7 +18,21 @@ final class DockCapture {
     private var deadline: TimeInterval?
     private var nextMetadata: TimeInterval = 0
     private var wallSettlesAfter: TimeInterval = 0
-    private var hovering = false
+    private(set) var hovering = false
+    private var magnification = false
+    private var autoHide = false
+    private var autoHideSettle: TimeInterval = 1.2
+    private var autoHideSettlesAfter: TimeInterval = 0
+    private var estimatedShelfHeight: CGFloat = 55
+    private var tileSize: CGFloat = 48
+    private var largeTileSize: CGFloat = 64
+    private var restoreAfter: TimeInterval?
+    private(set) var hidesOverlayForMagnification = false
+    private var pointerMonitor: Any?
+    private var autoHideFrameReady = false
+    private var wasAtRevealEdge = false
+    private var dragStart: CGPoint?
+    private var draggedDockItem = false
     private var wallpaper: CGImage?
     private var lastMetadata: Metadata?
     private var permission = false
@@ -25,7 +40,16 @@ final class DockCapture {
     private(set) var status = "idle snapshots"
     private(set) var wallpaperUpdates = 0
     private(set) var dockUpdates = 0
-    var shelf = CGRect.zero
+    var shelf = CGRect.zero {
+        didSet {
+            autoHideFrameReady = !shelf.isEmpty
+            if magOnVisibleDock, !hidesOverlayForMagnification, !shelf.isEmpty,
+               shelf.insetBy(dx: -9, dy: -5).contains(NSEvent.mouseLocation) {
+                hovering = true
+                setMagnificationHidden(true)
+            }
+        }
+    }
 
     private struct Pair: Equatable {
         let display: CGDirectDisplayID
@@ -42,8 +66,12 @@ final class DockCapture {
     private let dockPrefs = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Preferences/com.apple.dock.plist")
     private let wallPrefs = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support/com.apple.wallpaper/Store/Index.plist")
 
-    init(onUpdate: @escaping Update) { update = onUpdate }
+    init(onMagnificationVisibilityChange: @escaping () -> Void = {}, onUpdate: @escaping Update) {
+        self.onMagnificationVisibilityChange = onMagnificationVisibilityChange
+        update = onUpdate
+    }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+    private var magOnVisibleDock: Bool { magnification && !autoHide }
 
     func start() {
         guard !started else { return }
@@ -58,6 +86,7 @@ final class DockCapture {
         observe(NSWorkspace.activeSpaceDidChangeNotification, in: ws) { $0.layoutChanged(wall: true) }
         observe(NSApplication.didChangeScreenParametersNotification, in: .default) { $0.layoutChanged(wall: true) }
         let distributed = DistributedNotificationCenter.default()
+        observe(Notification.Name("com.apple.dock.prefchanged"), in: distributed) { $0.tick() }
         observe(Notification.Name("com.apple.screenIsUnlocked"), in: distributed) { $0.layoutChanged(wall: true, delay: 5.5) }
         observe(Notification.Name("com.apple.screensaver.didstop"), in: distributed) { $0.layoutChanged(wall: true, delay: 5.5) }
         observe(NSWorkspace.didLaunchApplicationNotification, in: ws, regularAppsOnly: true) { $0.layoutChanged(wall: false) }
@@ -82,6 +111,11 @@ final class DockCapture {
 
     func stop() {
         started = false
+        removePointerMonitor()
+        autoHide = false
+        magnification = false
+        restoreAfter = nil
+        hidesOverlayForMagnification = false
         epoch += 1
         deadline = nil
         wallpaper = nil
@@ -99,18 +133,144 @@ final class DockCapture {
 
     private func layoutChanged(wall: Bool, delay: TimeInterval = 0.70) {
         epoch += 1
+        autoHideFrameReady = false
         if wall {
             wallpaper = nil
+            shelf = .zero
+            hovering = false
+            wasAtRevealEdge = false
+            dragStart = nil
+            draggedDockItem = false
             wallSettlesAfter = max(wallSettlesAfter, now + delay)
         }
-        deadline = max(now + delay, wallSettlesAfter)
+        if magOnVisibleDock { shelf = .zero }
+        deadline = (magnification && autoHide) ? nil : max(now + delay, wallSettlesAfter, autoHideSettlesAfter)
         nextMetadata = 0
-        status = pauses.isEmpty ? "waiting for settled Dock" : "paused"
+        if hidesOverlayForMagnification { status = "native Dock (magnification)" }
+        else { status = pauses.isEmpty ? "waiting for settled Dock" : "paused" }
         update(nil, nil, nil, .zero)
     }
 
     private func modification(_ url: URL) -> Date? {
         try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    private func readDockGeometry() {
+        let settings = UserDefaults.standard.persistentDomain(forName: "com.apple.dock") ?? [:]
+        let delay = settings["autohide-delay"] as? Double ?? 0.5
+        let duration = settings["autohide-time-modifier"] as? Double ?? 0.5
+        autoHideSettle = max(0.25, max(0, delay) + max(0, duration) + 0.2)
+        tileSize = CGFloat(settings["tilesize"] as? Double ?? 48)
+        largeTileSize = max(tileSize, CGFloat(settings["largesize"] as? Double ?? 64))
+        estimatedShelfHeight = max(55, tileSize + 20)
+    }
+
+    private func removePointerMonitor() {
+        if let pointerMonitor { NSEvent.removeMonitor(pointerMonitor) }
+        pointerMonitor = nil
+    }
+
+    // Read just the two effective preferences. Plist writes can lag the actual
+    // settings, especially while System Settings is still open.
+    private func refreshMode() {
+        guard started else { return }
+        let domain = "com.apple.dock" as CFString
+        let magnifies = CFPreferencesGetAppBooleanValue("magnification" as CFString, domain, nil)
+        let hides = CFPreferencesGetAppBooleanValue("autohide" as CFString, domain, nil)
+        guard magnification != magnifies || autoHide != hides else { return }
+        magnification = magnifies
+        autoHide = hides
+        autoHideSettlesAfter = 0
+        removePointerMonitor()
+        if autoHide != magnification {
+            readDockGeometry()
+            // The native animation begins between presentation ticks. Hide on
+            // the pointer event itself; this path never requests a screenshot.
+            pointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, self.started, self.pauses.isEmpty,
+                          let screen = NSScreen.screens.first else { return }
+                    self.trackPointer(on: screen)
+                }
+            }
+        }
+        layoutChanged(wall: true)
+        restoreAfter = nil
+        if let screen = NSScreen.screens.first { trackPointer(on: screen) }
+    }
+
+    private func setMagnificationHidden(_ hidden: Bool) {
+        guard hidesOverlayForMagnification != hidden else { return }
+        hidesOverlayForMagnification = hidden
+        if hidden {
+            epoch += 1
+            // A capture invalidated halfway through must be retried at rest.
+            if inFlight && deadline == nil && !autoHide { deadline = now }
+            status = "native Dock (magnification)"
+        } else {
+            status = deadline == nil ? "on-demand snapshots" : "waiting for settled Dock"
+        }
+        onMagnificationVisibilityChange()
+    }
+
+    private func trackPointer(on screen: NSScreen, mayRestore: Bool = false) {
+        let point = NSEvent.mouseLocation
+        var region = shelf.isEmpty
+            ? CGRect(x: screen.frame.minX, y: screen.frame.minY, width: screen.frame.width,
+                     height: magOnVisibleDock ? max(estimatedShelfHeight, largeTileSize + 16) : estimatedShelfHeight)
+            : (autoHide ? shelf : shelf.insetBy(dx: -9, dy: -5))
+        if magOnVisibleDock && (hovering || hidesOverlayForMagnification) && !shelf.isEmpty {
+            // Keep the patch hidden as the cursor rides a growing outer tile
+            // beyond the resting shelf horizontally or vertically.
+            region = region.insetBy(dx: -max(0, largeTileSize - tileSize), dy: 0)
+            region.size.height = max(region.height, screen.frame.minY + largeTileSize + 16 - region.minY)
+        }
+        let atRevealEdge = autoHide && screen.frame.contains(point) && point.y - screen.frame.minY < 3 &&
+            point.x >= region.minX && point.x <= region.maxX
+        let overDock = (screen.frame.contains(point) && region.contains(point)) || atRevealEdge
+        let enteredOrLeft = hovering != overDock
+        let reachedEdge = atRevealEdge && !wasAtRevealEdge
+        hovering = overDock
+        wasAtRevealEdge = atRevealEdge
+
+        if magnification && (overDock || autoHide) {
+            if restoreAfter != nil { status = "native Dock (magnification)" }
+            restoreAfter = nil
+            setMagnificationHidden(true)
+        } else if magOnVisibleDock && hidesOverlayForMagnification {
+            if let restoreAfter {
+                if mayRestore && now >= restoreAfter {
+                    self.restoreAfter = nil
+                    setMagnificationHidden(false)
+                }
+            } else {
+                // Keep the cached mask off until native tiles are back at rest.
+                restoreAfter = now + 0.45
+                nextMetadata = 0
+                status = "waiting for icons to settle"
+            }
+        } else {
+            setMagnificationHidden(false)
+        }
+
+        if NSEvent.pressedMouseButtons & 1 != 0 {
+            if let start = dragStart {
+                if hypot(point.x - start.x, point.y - start.y) > 4 { draggedDockItem = true }
+            } else if overDock {
+                dragStart = point
+            }
+        } else if dragStart != nil {
+            dragStart = nil
+            if draggedDockItem {
+                draggedDockItem = false
+                layoutChanged(wall: false, delay: 0.25)
+            }
+        }
+
+        if autoHide && !magnification && (enteredOrLeft || (reachedEdge && !autoHideFrameReady)) {
+            autoHideSettlesAfter = now + autoHideSettle
+            layoutChanged(wall: false, delay: autoHideSettle)
+        }
     }
 
     // The WindowServer poll reads only identifiers, levels, shapes and owners. It
@@ -146,23 +306,18 @@ final class DockCapture {
     // Called by the application's existing presentation timer. Only layout events
     // can arm a screenshot; simply polling never arms one for an unchanged scene.
     func tick() {
-        guard started, pauses.isEmpty,
+        guard started, pauses.isEmpty else { return }
+        refreshMode()
+        guard !(magnification && autoHide),
               let screen = NSScreen.screens.first,
               let display = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value else { return }
         let time = now
-        let hoverRect = shelf.isEmpty
-            ? CGRect(x: screen.frame.minX, y: screen.frame.minY, width: screen.frame.width, height: 55)
-            : shelf.insetBy(dx: -9, dy: -5)
-        let overDock = hoverRect.contains(NSEvent.mouseLocation)
-        if overDock != hovering {
-            hovering = overDock
-            layoutChanged(wall: false)
-        }
         if time >= nextMetadata {
             let allowed = CGPreflightScreenCaptureAccess()
             let current = allowed ? metadata(on: display) : nil
             let old = lastMetadata
             lastMetadata = current
+            if (autoHide || magnification) && (old == nil || current?.dockConfig != old?.dockConfig) { readDockGeometry() }
             if permission != allowed || current?.pair != old?.pair || current?.wallpaperConfig != old?.wallpaperConfig {
                 layoutChanged(wall: true)
             } else if current?.windowIDs != old?.windowIDs || current?.dockConfig != old?.dockConfig {
@@ -171,9 +326,10 @@ final class DockCapture {
             permission = allowed
             nextMetadata = time + 3
         }
-        guard permission, !hovering, !inFlight, let due = deadline, time >= due,
+        trackPointer(on: screen, mayRestore: true)
+        guard permission, !inFlight, !hidesOverlayForMagnification, !autoHide || hovering, let deadline, time >= deadline,
               let pair = lastMetadata?.pair, pair.display == display else { return }
-        deadline = nil
+        self.deadline = nil
         inFlight = true
         let token = epoch
         let height = min(150.0, screen.frame.height)
@@ -184,8 +340,9 @@ final class DockCapture {
             guard let self else { return }
             defer { self.inFlight = false }
             do {
+                guard self.canFinishCapture(token, on: screen) else { return }
                 let available = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard self.epoch == token, !self.hovering else { return }
+                guard self.canFinishCapture(token, on: screen) else { return }
                 guard let dockWindow = available.windows.first(where: { $0.windowID == pair.dock }),
                       let wallWindow = available.windows.first(where: { $0.windowID == pair.wallpaper }) else {
                     self.status = "native Dock or wallpaper unavailable"
@@ -204,12 +361,12 @@ final class DockCapture {
                 config.colorSpaceName = CGColorSpace.sRGB
                 if self.wallpaper == nil {
                     let wall = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: wallWindow), configuration: config)
-                    guard self.epoch == token else { return }
+                    guard self.canFinishCapture(token, on: screen) else { return }
                     self.wallpaper = wall
                     self.wallpaperUpdates += 1
                 }
                 let dock = try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: dockWindow), configuration: config)
-                guard self.epoch == token, let wallpaper = self.wallpaper else { return }
+                guard self.canFinishCapture(token, on: screen), let wallpaper = self.wallpaper else { return }
                 self.dockUpdates += 1
                 self.status = "on-demand snapshots"
                 self.update(dock, wallpaper, screen, area)
@@ -218,5 +375,11 @@ final class DockCapture {
                 if self.epoch == token { self.status = "snapshot unavailable" }
             }
         }
+    }
+
+    private func canFinishCapture(_ token: Int, on screen: NSScreen) -> Bool {
+        refreshMode()
+        if magOnVisibleDock { trackPointer(on: screen) }
+        return started && epoch == token && !hidesOverlayForMagnification
     }
 }

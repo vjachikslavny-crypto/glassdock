@@ -44,6 +44,7 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
     private var covered = false
     private var clippedRegions: [CGRect] = []
     private var appliedRegions: [CGRect]?
+    private var wasHovering = false
     private var lastGood: (image: CGImage, area: CGRect, scale: CGFloat, shelf: CGRect)?
     private var compositions: UInt64 = 0
     private var previousCounters = ""
@@ -82,7 +83,13 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
 
     private func start() {
         guard capture == nil else { return }
-        let component = DockCapture { [weak self] dock, wallpaper, screen, area in
+        let component = DockCapture(onMagnificationVisibilityChange: { [weak self] in
+            guard let self else { return }
+            if self.capture?.hidesOverlayForMagnification == false, let info = self.lastGood {
+                self.checkWindows(in: info.area, shelf: info.shelf)
+            }
+            self.present()
+        }) { [weak self] dock, wallpaper, screen, area in
             guard let self else { return }
             guard let dock, let wallpaper, screen != nil, !area.isEmpty,
                   dock.width == wallpaper.width, dock.height == wallpaper.height else {
@@ -153,14 +160,19 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
 
     private func updatePresentation(forceWindowCheck: Bool = false) {
         capture?.tick()
+        let hovering = capture?.hovering == true
+        if wasHovering != hovering {
+            wasHovering = hovering
+            present()
+        }
         if let counterFile, let capture {
-            let counters = "wall=\(capture.wallpaperUpdates) dock=\(capture.dockUpdates) rendered=\(compositions) visible=\(panel.isVisible) mode=\(capture.status)\n"
+            let counters = "wall=\(capture.wallpaperUpdates) dock=\(capture.dockUpdates) rendered=\(compositions) visible=\(panel.isVisible) hover=\(hovering) mode=\(capture.status)\n"
             if counters != previousCounters,
                (try? counters.write(to: counterFile, atomically: true, encoding: .utf8)) != nil {
                 previousCounters = counters
             }
         }
-        guard let sample = lastGood else { return }
+        guard capture?.hidesOverlayForMagnification != true, let sample = lastGood else { return }
         // Recheck quickly during a window drag and just after release. Typing or
         // simply moving the pointer need not enumerate every window on the desktop.
         if !forceWindowCheck && ProcessInfo.processInfo.systemUptime - lastWindowCheck < 3 &&
@@ -170,7 +182,16 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
         }
         let wasCovered = covered
         checkWindows(in: sample.area, shelf: sample.shelf)
-        if wasCovered != covered || appliedRegions != clippedRegions { present() }
+        if wasCovered != covered || appliedRegions != presentationCutouts(area: sample.area, shelf: sample.shelf) { present() }
+    }
+
+    private func presentationCutouts(area: CGRect, shelf: CGRect) -> [CGRect] {
+        guard wasHovering else { return clippedRegions }
+        // A cached shadow patch can cover the Dock's live title above a tile.
+        // Leave that band to the native Dock while the pointer is over the shelf.
+        let titleBand = CGRect(x: 0, y: shelf.maxY - area.minY + 2,
+                               width: area.width, height: max(0, area.maxY - shelf.maxY - 2))
+        return titleBand.isEmpty ? clippedRegions : clippedRegions + [titleBand]
     }
 
     private func checkWindows(in area: CGRect, shelf: CGRect) {
@@ -187,7 +208,9 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
                   let dict = row[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: dict as CFDictionary) else { continue }
             let frame = CGRect(x: rect.minX, y: main.frame.maxY-rect.maxY, width: rect.width, height: rect.height)
-            if frame.intersects(shelf.insetBy(dx: 3, dy: 3)) { return }
+            // Cover only the parts with actual wallpaper behind them. A small
+            // floating window at one end must not dismiss the entire patch.
+            if frame.contains(shelf.insetBy(dx: 3, dy: 3)) { return }
             let overlap = area.intersection(frame)
             if !overlap.isEmpty { regions.append(overlap.offsetBy(dx: -area.minX, dy: -area.minY)) }
         }
@@ -196,7 +219,8 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
     }
 
     private func present() {
-        guard !covered, let info = lastGood, let layer = panel.contentView?.layer else {
+        guard capture?.hidesOverlayForMagnification != true, !covered,
+              let info = lastGood, let layer = panel.contentView?.layer else {
             if panel.isVisible { panel.orderOut(nil) }
             return
         }
@@ -206,18 +230,19 @@ private final class DockGlass: NSObject, NSApplicationDelegate {
             panel.setFrame(info.area, display: false)
             appliedRegions = nil
         }
-        if appliedRegions != clippedRegions {
-            if clippedRegions.isEmpty { layer.mask = nil }
+        let regions = presentationCutouts(area: info.area, shelf: info.shelf)
+        if appliedRegions != regions {
+            if regions.isEmpty { layer.mask = nil }
             else {
                 let full = CGRect(origin: .zero, size: info.area.size)
                 let windows = CGMutablePath()
-                for rect in clippedRegions { windows.addRect(rect) }
+                for rect in regions { windows.addRect(rect) }
                 let cutout = CAShapeLayer()
                 cutout.frame = full
                 cutout.path = CGPath(rect: full, transform: nil).subtracting(windows)
                 layer.mask = cutout
             }
-            appliedRegions = clippedRegions
+            appliedRegions = regions
         }
         layer.contentsScale = info.scale
         layer.contents = info.image
