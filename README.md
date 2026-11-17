@@ -1,10 +1,10 @@
 # GlassDock
 
-[![На морских обоях фон Dock исчезает при включении прозрачности и возвращается при выключении](docs/media/dock-demo.gif)](docs/media/dock-demo.mp4)
+[![Прозрачность строки меню Finder и нижнего Dock по очереди включается и выключается на морских обоях](docs/media/dock-demo.gif)](docs/media/dock-demo.mp4)
 
 <a href="https://github.com/vjachikslavny-crypto/glassdock/releases/latest/download/GlassDock.dmg"><img src="docs/media/download-mac.png" alt="Скачать GlassDock для Mac (.dmg)" width="198" height="44"></a>
 
-macOS 15 и новее · Apple Silicon и Intel · [Смотреть видео (8 секунд)](docs/media/dock-demo.mp4)
+macOS 15 и новее · Apple Silicon и Intel · [Строка меню и Dock в действии (10 секунд)](docs/media/dock-demo.mp4)
 
 GlassDock показывает обои за строкой меню и между значками нижнего Dock. В окне приложения два отдельных переключателя. Можно включить один эффект, оба или выключить их в любой момент.
 
