@@ -3,8 +3,25 @@ import Darwin
 import ServiceManagement
 import SwiftUI
 
+private enum InterfaceLanguage: String {
+    case system, english = "en", russian = "ru"
+
+    static let preference = "InterfaceLanguage"
+
+    static var current: Self {
+        Self(rawValue: UserDefaults.standard.string(forKey: preference) ?? "") ?? .system
+    }
+
+    var code: String {
+        if self == .system {
+            return Bundle.preferredLocalizations(from: ["en", "ru"]).first ?? "en"
+        }
+        return rawValue
+    }
+}
+
 private func tr(_ russian: String, _ english: String) -> String {
-    Bundle.preferredLocalizations(from: ["en", "ru"]).first == "ru" ? russian : english
+    InterfaceLanguage.current.code == "ru" ? russian : english
 }
 
 private enum Effect: String, CaseIterable, Identifiable {
@@ -17,8 +34,8 @@ private enum Effect: String, CaseIterable, Identifiable {
     var supported: Bool { self != .menu || ProcessInfo.processInfo.operatingSystemVersion.majorVersion < 26 }
     var detail: String {
         if !supported { return tr("В этой версии macOS уже есть прозрачная строка меню.", "This version of macOS already has a transparent menu bar.") }
-        if self == .menu { return tr("Обои за меню и системными значками.", "Show the wallpaper behind menus and status icons.") }
-        return tr("Обои между значками нижнего Dock.", "Show the wallpaper between icons in the bottom Dock.")
+        if self == .menu { return tr("Обои за меню и системными значками.", "Wallpaper behind menus and status icons.") }
+        return tr("Обои между значками нижнего Dock.", "Wallpaper between icons in the bottom Dock.")
     }
     func runningApps() -> [NSRunningApplication] {
         NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).filter { !$0.isTerminated }
@@ -86,6 +103,10 @@ private enum Helpers {
         config.activates = false
         config.createsNewApplicationInstance = false
         config.addsToRecentItems = false
+        let language = InterfaceLanguage.current
+        if language != .system {
+            config.arguments = ["-AppleLanguages", "(\(language.rawValue))"]
+        }
         _ = try await NSWorkspace.shared.openApplication(at: url, configuration: config)
     }
 
@@ -180,6 +201,7 @@ private struct EdgeIcon: View {
 
 private struct ControlView: View {
     @StateObject private var controls = Controls()
+    @AppStorage(InterfaceLanguage.preference) private var language = InterfaceLanguage.system
     @Environment(\.scenePhase) private var scenePhase
     let activity = NSWorkspace.shared.notificationCenter
 
@@ -198,6 +220,7 @@ private struct ControlView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(effect.title).font(.headline)
                             Text(effect.detail).font(.callout).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         Spacer(minLength: 8)
                         if controls.busy.contains(effect) { ProgressView().controlSize(.small) }
@@ -236,6 +259,14 @@ private struct ControlView: View {
                 }.buttonStyle(.link)
             }
             Divider()
+            Picker(tr("Язык", "Language"), selection: $language) {
+                Text(tr("Как в macOS", "Use system language")).tag(InterfaceLanguage.system)
+                Text(verbatim: "English").tag(InterfaceLanguage.english)
+                Text(verbatim: "Русский").tag(InterfaceLanguage.russian)
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+            .accessibilityIdentifier("interface-language")
             HStack {
                 Menu(tr("Разрешения macOS", "macOS permissions")) {
                     Button(tr("Запись экрана…", "Screen Recording…")) { settings("Privacy_ScreenCapture") }
@@ -246,6 +277,7 @@ private struct ControlView: View {
                     .buttonStyle(.link)
             }
         }
+        .environment(\.locale, Locale(identifier: language.code))
         .padding(24)
         .frame(width: 480)
         .onAppear { controls.refresh() }

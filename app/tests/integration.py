@@ -51,6 +51,15 @@ private enum Checks {
             throw ControlError("\\(message): \\(controls.running), error=\\(String(describing: controls.failure))")
         }
         do {
+            let prefs = UserDefaults.standard
+            try require(InterfaceLanguage.current == .system, "New installs follow macOS")
+            for (code, title) in [("en", "Menu bar"), ("ru", "Строка меню")] {
+                prefs.set(code, forKey: InterfaceLanguage.preference)
+                try require(InterfaceLanguage.current.code == code && Effect.menu.title == title, "Explicit interface language")
+            }
+            prefs.set("unknown", forKey: InterfaceLanguage.preference)
+            try require(InterfaceLanguage.current == .system, "Unknown language falls back to macOS")
+            prefs.removeObject(forKey: InterfaceLanguage.preference)
             try await checkState([], "Clean launch")
             let legacyDock = URL(fileURLWithPath: ProcessInfo.processInfo.environment["TEST_LEGACY_DOCK"]!)
             let installedDock = legacyDock.deletingLastPathComponent().appendingPathComponent("GlassDock.app", isDirectory: true)

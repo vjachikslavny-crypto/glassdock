@@ -1,5 +1,5 @@
-GlassDock 0.1.7 убирает заметную границу прозрачного Dock. Тень соседнего окна продолжается на обоях между значками, а внешняя тень самой полки компенсируется.
+GlassDock 0.1.8 adds a language picker to the main window. Choose English, Russian, or the system language. The controls update immediately and the choice persists across launches.
 
-Для установки скачай **GlassDock.dmg** и перетащи приложение в «Программы». При обновлении с предыдущей версии замени старую копию и в новом GlassDock выключи и снова включи переключатель **Dock**. Файл для скачивания называется **GlassDock.dmg**, приложение в Finder и в запросе записи экрана для нижнего Dock называется **GlassDock**. При обновлении macOS может попросить подтвердить доступ ещё раз. У верхней строки отдельные разрешения для **Sheer**.
+The README, demo captions, and download button are now in English. The demo shows the menu bar and the Dock switching independently on the same wallpaper.
 
-Универсальная сборка для Apple Silicon и Intel, начиная с macOS 15. Выпускается без нотарификации Apple. [Установка и разрешения](https://github.com/vjachikslavny-crypto/glassdock#установка)
+Download **GlassDock.dmg** and drag **GlassDock** to **Applications**. The disk image supports Apple silicon and Intel on macOS 15 or later. The build is not notarized by Apple. [Installation and permissions](https://github.com/vjachikslavny-crypto/glassdock#installation)
